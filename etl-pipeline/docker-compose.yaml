@@ -1,0 +1,241 @@
+version: '3.8'
+
+# -----------------------------
+#  COMMON CONFIG FOR AIRFLOW
+# -----------------------------
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.9.3 # готовий образ для airflow
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment:
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW_EXECUTOR}
+    AIRFLOW__CORE__FERNET_KEY: '' #  ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${LOAD_EXAMPLES}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    
+    # Підключення до БД Метаданих Airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_AIRFLOW_USER}:${POSTGRES_AIRFLOW_PASSWORD}@postgres-airflow:5432/${POSTGRES_AIRFLOW_DB}
+
+    # # Налаштування логів у MinIO
+    AIRFLOW__LOGGING__REMOTE_LOGGING: 'True'
+    AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: minio_s3_storage # Airflow буде шукати це підключення
+    AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: s3://${BUCKET_LOGS}
+    AIRFLOW__LOGGING__ENCRYPT_S3_LOGS: 'False'
+
+    ASSETS_BUCKET: ${ASSETS_BUCKET}
+
+    # Додавання бібліотек 
+    # _PIP_ADDITIONAL_REQUIREMENTS можна додати через термінал перед запуском, для тестування, не змінюючи .env
+    # ADDITIONAL_PYTHON_DEPS буде використано якщо в термінал не було введено тимчасових значень
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-${ADDITIONAL_PYTHON_DEPS}}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+services:
+  # -----------------------------
+  # 1. БД Метаданих (Airflow System)
+  # -----------------------------
+  postgres-airflow:
+    image: postgres:15
+    container_name: postgres-airflow-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_AIRFLOW_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_AIRFLOW_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_AIRFLOW_DB}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_AIRFLOW_USER}", "-d", "${POSTGRES_AIRFLOW_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------
+  # 2. БД РЕЦЕПТІВ (Business Data)
+  # -----------------------------
+  postgres-recipes:
+    image: postgres:15
+    container_name: postgres-recipes-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_RECIPE_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_RECIPE_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_RECIPE_DB}
+    volumes:
+      - recipe-db-data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_RECIPE_PORT}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_RECIPE_USER}", "-d", "${POSTGRES_RECIPE_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -----------------------------
+  # 3. MINIO (Storage) для зображень та логів
+  # -----------------------------
+  minio:
+    image: minio/minio
+    container_name: minio-storage
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":${MINIO_CONSOLE_PORT}"
+    ports:
+      - "${MINIO_API_PORT}:${MINIO_API_PORT}" # API
+      - "${MINIO_CONSOLE_PORT}:${MINIO_CONSOLE_PORT}" # Веб-консоль
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${MINIO_API_PORT}/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  # -----------------------------
+  # 4. MINIO INIT (Створення бакету)
+  # -----------------------------
+  minio-init:
+    image: minio/mc
+    container_name: minio-init-bucket
+    entrypoint: /bin/sh
+    command: >
+      -c '
+      echo "Connecting to MinIO";
+      /usr/bin/mc alias set myminio http://minio:${MINIO_API_PORT} ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+
+      echo "Creating buckets";
+      /usr/bin/mc mb myminio/${BUCKET_LOGS} || echo "Bucket logs exists";
+      /usr/bin/mc mb myminio/${ASSETS_BUCKET} || echo "Bucket assets exists";
+
+      echo "MinIO init complete.";
+      '
+    depends_on:
+      minio:
+        condition: service_healthy # <--- ЗАЛЕЖНІСТЬ ВІД MINIO
+
+  # -----------------------------
+  # 5. AIRFLOW INIT (DB + Users + Connections)
+  # -----------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command: >
+      -c '
+      echo "Initializing Airflow DB";
+      airflow db init;
+
+      echo "Creating Admin User";
+      airflow users create \
+        --username "${ADMIN_USERNAME}" \
+        --password "${ADMIN_PASSWORD}" \
+        --firstname Admin \
+        --lastname User \
+        --role Admin \
+        --email "${ADMIN_EMAIL}" || true;
+      
+      echo "Removing old connections";
+      airflow connections delete minio_s3_storage || true;
+      airflow connections delete recipe_db_postgres || true;
+
+      echo "Adding Connections";
+
+      echo "Creating MinIO connection...";
+      airflow connections add "minio_s3_storage" \
+        --conn-type "aws" \
+        --conn-login ${MINIO_ROOT_USER} \
+        --conn-password ${MINIO_ROOT_PASSWORD} \
+        --conn-extra "{\"endpoint_url\": \"http://minio:${MINIO_API_PORT}\"}";
+
+      echo "Creating Recipe DB connection...";
+      airflow connections add "recipe_db_postgres" \
+        --conn-type "postgres" \
+        --conn-login "${POSTGRES_RECIPE_USER}" \
+        --conn-password "${POSTGRES_RECIPE_PASSWORD}" \
+        --conn-host "postgres-recipes" \
+        --conn-port "5432" \
+        --conn-schema "${POSTGRES_RECIPE_DB}";
+
+      echo "Initialization complete.";
+      '
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      minio-init: # <--- ЗАЛЕЖНІСТЬ ВІД MINIO-INIT
+        condition: service_completed_successfully
+
+  # -----------------------------
+  # 6. WEB SERVER
+  # -----------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      airflow-init: # <--- ЗАЛЕЖНІСТЬ ВІД INIT
+        condition: service_completed_successfully
+
+  # -----------------------------
+  # 7. SCHEDULER
+  # -----------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  gpt4free:
+    image: hlohaus789/g4f:latest 
+    container_name: g4f-server
+    restart: always
+    # Виділяємо спільну пам'ять для браузера Chrome
+    shm_size: "2gb"
+    # Налаштування портів
+    ports:
+      - "9090:8080"  # GUI (Чат) буде на localhost:9090 (щоб не заважати Airflow на 8080)
+      - "1337:1337"  # API (для тестів з Windows)
+      - "7900:7900"  # VNC (екран браузера для відладки)
+    # Підключаємо папки, які створили в Кроці 1
+    volumes:
+      - ./g4f_data/har_and_cookies:/app/har_and_cookies
+      - ./g4f_data/generated_images:/app/generated_images
+    
+    # не даємо йому покласти весь комп'ютер
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 3g
+    
+
+
+volumes:
+  airflow-db-data:
+  recipe-db-data:
+  minio-data:
+  
+networks:
+  default:
+    name: airflow-network

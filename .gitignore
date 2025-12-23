@@ -1,0 +1,82 @@
+# ==========================================
+# СЕКРЕТИ ТА КОНФІГУРАЦІЯ (.env)
+# ==========================================
+# Файли з паролями, ключами API та секретами
+.env
+.env.*
+# Дозволяємо лише приклад файлу (якщо такий є)
+!.env.example
+*.log
+
+# Дані бібліотеки g4f (кеш, сесії, куки)
+g4f_data/
+
+logs/
+# ==========================================
+# FastAPI / Python
+# ==========================================
+# Кеш виконання Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Віртуальне оточення (Virtual Environment)
+.venv/
+venv/
+ENV/
+env/
+
+# Дистрибутиви, збірки та метадані
+dist/
+build/
+*.egg-info/
+
+# Тестування та покриття коду
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# Android / Kotlin
+# ==========================================
+# Тимчасові файли та папки збірки Gradle
+build/
+*/build/
+bin/
+gen/
+
+# Gradle (локальні налаштування)
+.gradle/
+gradlew
+gradlew.bat
+gradle/wrapper/gradle-wrapper.jar
+
+# Локальні налаштування розробника (шлях до SDK тощо)
+local.properties
+
+# Налаштування Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Результати збірки (готові додатки)
+*.apk
+*.aar
+*.ap_
+*.dex
+
+# Специфічне для Kotlin
+.kotlin/
+kotlin-daemon-embeddable-*.jar
+
+# ==========================================
+# СИСТЕМНІ ФАЙЛИ ТА РЕДАКТОРИ
+# ==========================================
+.DS_Store
+Thumbs.db
+.vscode/
